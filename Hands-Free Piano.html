@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hands-Free Piano</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
+--bg:#f4f1ea;--fg:#1d1b18;--white:#fffdf8;--accent:#e0663a;--card:#fff}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#15130f;--fg:#f1ede4;--white:#e9e4d8;--card:#221f1a}}
+:root[data-theme="dark"]{--bg:#15130f;--fg:#f1ede4;--white:#e9e4d8;--card:#221f1a}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;display:flex;flex-direction:column;overflow:hidden}
+header{padding:14px 16px 4px;text-align:center}
+h1{margin:0;font-size:1.3rem}
+p.sub{margin:4px 0 0;font-size:.85rem;opacity:.7}
+.bar{display:flex;gap:8px;justify-content:center;align-items:center;flex-wrap:wrap;padding:8px}
+button{font:inherit;padding:10px 14px;border-radius:10px;border:0;background:var(--accent);color:#fff;font-weight:600}
+button.alt{background:var(--card);color:var(--fg);border:1px solid #8884}
+label{font-size:.8rem;display:flex;align-items:center;gap:6px;opacity:.85}
+#status{text-align:center;font-size:.8rem;min-height:1.2em;opacity:.8;padding:0 12px}
+#piano{position:relative;flex:1;display:flex;margin:10px;gap:3px;min-height:0}
+.key{flex:1;border-radius:0 0 12px 12px;background:var(--white);display:flex;align-items:flex-end;justify-content:center;padding-bottom:12px;font-weight:700;font-size:.9rem;color:#0007;
+--p:0;background-image:linear-gradient(to top,var(--accent) calc(var(--p)*100%),transparent 0);transition:transform .08s}
+.key.on{transform:translateY(4px);filter:brightness(1.15)}
+.key.hot{outline:3px solid var(--accent);outline-offset:-3px}
+#dot{position:fixed;width:26px;height:26px;margin:-13px 0 0 -13px;border-radius:50%;border:3px solid var(--accent);background:#e0663a44;pointer-events:none;z-index:50;display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>🎹 Hands-Free Piano</h1>
+  <p class="sub">Move your head (or a finger) over a key and hold to play.</p>
+</header>
+<div class="bar">
+  <button id="head">Start head tracking</button>
+  <button id="finger" class="alt">Use finger tracking</button>
+  <button id="recenter" class="alt" style="display:none">Recenter</button>
+</div>
+<div class="bar" style="padding-top:0">
+  <label>Sensitivity <input type="range" id="sens" min="0.8" max="4" step="0.1" value="1.7"></label>
+</div>
+<div id="status">Choose a mode to begin.</div>
+<div id="piano"></div>
+<div id="dot"></div>
+
+<script>
+const WHITE=[["C",261.63],["D",293.66],["E",329.63],["F",349.23],["G",392],["A",440],["B",493.88],["C",523.25]];
+const DWELL=600;
+const piano=document.getElementById("piano"),dot=document.getElementById("dot"),statusEl=document.getElementById("status");
+let ctx=null,mode=null,gx=-100,gy=-100,cur=null,since=0;
+
+WHITE.forEach(([n,f])=>{const k=document.createElement("div");k.className="key";k.dataset.f=f;k.textContent=n;piano.appendChild(k)});
+
+function setStatus(s){statusEl.textContent=s}
+function startAudio(){ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();ctx.resume()}
+function play(f,el){
+  if(!ctx)return;
+  const t=ctx.currentTime,o=ctx.createOscillator(),o2=ctx.createOscillator(),g=ctx.createGain();
+  o.type="triangle";o2.type="sine";o.frequency.value=f;o2.frequency.value=f*2;
+  g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(.35,t+.01);g.gain.exponentialRampToValueAtTime(.001,t+1.6);
+  o.connect(g);o2.connect(g);g.connect(ctx.destination);o.start(t);o2.start(t);o.stop(t+1.7);o2.stop(t+1.7);
+  el.classList.add("on");setTimeout(()=>el.classList.remove("on"),180);
+}
+
+// ---- One Euro filter: strong smoothing when still, low lag when moving ----
+const OE={xp:null,dxp:0,tp:0};
+const al=(c,dt)=>1/(1+(1/(2*Math.PI*c))/dt);
+function filt(x){
+  const t=performance.now()/1000;
+  if(OE.xp===null){OE.xp=x;OE.tp=t;OE.dxp=0;return x}
+  const dt=Math.max(1e-3,t-OE.tp);OE.tp=t;
+  OE.dxp+=al(1,dt)*((x-OE.xp)/dt-OE.dxp);
+  OE.xp+=al(0.8+0.012*Math.abs(OE.dxp),dt)*(x-OE.xp);
+  return OE.xp;
+}
+function setGaze(x,y){gx=filt(x);gy=y;dot.style.display="block";dot.style.left=gx+"px";dot.style.top=gy+"px"}
+function loseGaze(){gx=-100;OE.xp=null;dot.style.display="none"}
+
+// ---- Dwell logic with sticky keys (hysteresis) so edges don't flicker ----
+function tick(now){
+  let el=null;
+  if(mode&&gx>=0){
+    if(cur){const r=cur.getBoundingClientRect(),m=r.width*.2;if(gx>=r.left-m&&gx<=r.right+m)el=cur}
+    if(!el){const e=document.elementFromPoint(gx,gy);el=e&&e.closest&&e.closest(".key")}
+  }
+  if(el!==cur){if(cur){cur.style.setProperty("--p",0);cur.classList.remove("hot")}cur=el;since=now;if(cur)cur.classList.add("hot")}
+  if(cur){
+    const p=Math.min(1,(now-since)/DWELL);cur.style.setProperty("--p",p);
+    if(p>=1){play(+cur.dataset.f,cur);since=now+250;cur.style.setProperty("--p",0)}
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+// ---- Head tracking (WebGazer face landmarks) ----
+let neutral=null,buf=[],misses=0,headOn=false;
+const sens=()=>+document.getElementById("sens").value;
+function faceX(){
+  try{
+    const p=webgazer.getTracker().getPositions();
+    if(!p||!p[1]||!p[234]||!p[454])return null;
+    const cx=(p[1][0]*2+p[168][0]+p[10][0])/4;           // weighted: nose tip, between eyes, forehead
+    const w=Math.abs(p[454][0]-p[234][0])||1;              // face width, so leaning in/out doesn't skew it
+    return {cx,w};
+  }catch(e){return null}
+}
+function recenter(){
+  if(mode==="finger"){retakeBg();return}
+  neutral=null;buf=[];loseGaze();setStatus("Face the screen and hold still…");
+}
+function headLoop(){
+  if(!headOn)return;
+  const f=faceX();
+  if(!f){if(++misses>20)loseGaze();if(misses===240)setStatus("No face detected. Check lighting and camera position.")}
+  else{
+    misses=0;
+    if(neutral===null){
+      buf.push(f.cx);
+      if(buf.length>=30){neutral=buf.reduce((a,b)=>a+b)/buf.length;setStatus("Turn or lean left/right to move. Hold on a key to play.")}
+    }else{
+      const dxn=(neutral-f.cx)/f.w;                         // mirrored: right = right, in face-widths
+      const r=piano.getBoundingClientRect();
+      const sx=innerWidth/2+dxn*sens()*innerWidth;
+      setGaze(Math.max(2,Math.min(innerWidth-2,sx)),r.top+r.height/2);
+    }
+  }
+  requestAnimationFrame(headLoop);
+}
+document.getElementById("head").onclick=async()=>{
+  startAudio();setStatus("Loading face tracker… allow camera access.");
+  try{
+    await new Promise((res,rej)=>{const s=document.createElement("script");
+      s.src="https://cdn.jsdelivr.net/npm/webgazer/dist/webgazer.min.js";s.onload=res;s.onerror=()=>rej(new Error("load"));document.head.appendChild(s)});
+    await webgazer.begin();
+    try{webgazer.showPredictionPoints(false)}catch(e){}
+    fingerOn=false;mode="head";headOn=true;recenter();
+    document.getElementById("recenter").style.display="";
+    requestAnimationFrame(headLoop);
+  }catch(err){
+    setStatus("Couldn't start head tracking here (camera or library blocked). Try opening this page in a regular browser tab.");
+  }
+};
+document.getElementById("recenter").onclick=recenter;
+
+// ---- Finger tracking: model-free, topmost point differing from a captured background ----
+const FW=80,FH=60;
+let fv=null,fx=null,bg=null,bgN=0,warm=0,fingerOn=false;
+function retakeBg(){bg=new Float32Array(FW*FH*3);bgN=0;warm=0;loseGaze();
+  setStatus("Keep your hand out of view and hold still… capturing background.")}
+function fingerLoop(){
+  if(!fingerOn)return;
+  if(fv.readyState>=2){
+    fx.drawImage(fv,0,0,FW,FH);
+    const d=fx.getImageData(0,0,FW,FH).data;
+    if(bgN<20){
+      if(++warm>30){
+        for(let i=0,j=0;i<d.length;i+=4,j+=3){bg[j]+=d[i]/20;bg[j+1]+=d[i+1]/20;bg[j+2]+=d[i+2]/20}
+        if(++bgN===20)setStatus("Point one finger up and move it left/right. Hold over a key to play.");
+      }
+    }else{
+      const cnt=new Array(FH).fill(0),sum=new Array(FH).fill(0);
+      for(let y=0;y<FH;y++)for(let x=0;x<FW;x++){
+        const k=(y*FW+x)*4,j=(y*FW+x)*3;
+        if(Math.abs(d[k]-bg[j])+Math.abs(d[k+1]-bg[j+1])+Math.abs(d[k+2]-bg[j+2])>110){cnt[y]++;sum[y]+=x}
+      }
+      let tip=null;
+      for(let y=0;y<FH-3;y++){
+        if(cnt[y]>=3&&cnt[y+1]>=3&&cnt[y+2]>=3){tip=(sum[y]+sum[y+1]+sum[y+2])/(cnt[y]+cnt[y+1]+cnt[y+2]);break}
+      }
+      if(tip===null)loseGaze();
+      else{const r=piano.getBoundingClientRect();
+        setGaze(Math.max(2,Math.min(innerWidth-2,(1-tip/FW)*innerWidth)),r.top+r.height/2)}
+    }
+  }
+  requestAnimationFrame(fingerLoop);
+}
+document.getElementById("finger").onclick=async()=>{
+  startAudio();setStatus("Allow camera access…");
+  try{
+    headOn=false;
+    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:320,height:240}});
+    fv=document.createElement("video");fv.muted=true;fv.playsInline=true;fv.srcObject=stream;
+    fv.style.cssText="position:fixed;right:8px;bottom:8px;width:110px;border-radius:8px;transform:scaleX(-1);z-index:30;opacity:.8";
+    document.body.appendChild(fv);await fv.play();
+    const c=document.createElement("canvas");c.width=FW;c.height=FH;fx=c.getContext("2d",{willReadFrequently:true});
+    mode="finger";fingerOn=true;retakeBg();
+    document.getElementById("recenter").style.display="";
+    requestAnimationFrame(fingerLoop);
+  }catch(err){
+    setStatus("Couldn't access the camera here. Try opening the page in a regular browser tab.");
+  }
+};
+</script>
+</body>
+</html>
